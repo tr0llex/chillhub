@@ -27,9 +27,23 @@ function load(...names) {
   return new Function(body + '\nreturn {' + names.join(',') + '};')();
 }
 
+function extractConst(name) {
+  const re = new RegExp('const\\s+' + name + '\\s*=\\s*\\{[\\s\\S]*?\\};');
+  const m = src.match(re);
+  if (!m) throw new Error('не найдена константа ' + name);
+  return m[0];
+}
+
 const { bumpSemverPatch } = load('bumpSemverPatch');
 const { formatBytes } = load('formatBytes');
 const { normalizeHumanDate, toRfc3339 } = load('toRfc3339', 'normalizeHumanDate');
+
+// sectionFromHash зовёт HASH_TAB_MAP, а не другую function, поэтому load()
+// (которая склеивает только function-объявления) сюда не годится — константа
+// добавляется в тело отдельно.
+const { sectionFromHash } = new Function(
+  extractConst('HASH_TAB_MAP') + '\n' + extract('sectionFromHash') +
+  '\nreturn {sectionFromHash};')();
 
 test('bumpSemverPatch поднимает патч, а не что-то другое', () => {
   assert.strictEqual(bumpSemverPatch('1.2.2'), '1.2.3');
@@ -92,6 +106,45 @@ test('пустая и неразбираемая дата дают пустую 
 test('toRfc3339 всегда выдаёт UTC с суффиксом Z', () => {
   const out = toRfc3339(new Date(Date.UTC(2026, 0, 15, 10, 30, 45)));
   assert.strictEqual(out, '2026-01-15T10:30:45Z');
+});
+
+// sectionFromHash сама читает глобальный location — не аргумент, а свойство
+// window в браузере. В Node глобала location нет, поэтому тест подставляет
+// его через global (в теле, порождённом new Function, это то же самое, что
+// window в браузере) и обязательно убирает за собой.
+function withHash(hash, fn) {
+  const had = 'location' in global;
+  const prev = global.location;
+  global.location = { hash };
+  try {
+    return fn();
+  } finally {
+    if (had) global.location = prev; else delete global.location;
+  }
+}
+
+test('sectionFromHash понимает каждый известный слаг', () => {
+  const cases = {
+    launcher: 'secLauncher', manifests: 'secManifests', news: 'secNews',
+    inbox: 'secInbox', maint: 'secMaint', metrics: 'secMetrics',
+  };
+  for (const [slug, sec] of Object.entries(cases)) {
+    assert.strictEqual(withHash('#' + slug, sectionFromHash), sec, slug);
+  }
+});
+
+test('sectionFromHash регистронезависима и терпит пробелы', () => {
+  assert.strictEqual(withHash('#LAUNCHER', sectionFromHash), 'secLauncher');
+  assert.strictEqual(withHash('#  metrics  ', sectionFromHash), 'secMetrics');
+});
+
+test('sectionFromHash даёт null на пустом или неизвестном хэше', () => {
+  // null — это "не решать за вызывающего": showSection получает либо
+  // конкретную секцию, либо явное "смотри дальше" (сохранённая вкладка),
+  // а не тихую подмену на дефолт прямо здесь.
+  for (const hash of ['', '#', '#nonsense', '#secLauncher']) {
+    assert.strictEqual(withHash(hash, sectionFromHash), null, hash);
+  }
 });
 
 test('toRfc3339 дополняет однозначные числа нулём', () => {

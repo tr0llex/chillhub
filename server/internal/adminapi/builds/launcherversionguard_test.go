@@ -3,6 +3,7 @@ package builds
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -130,5 +131,131 @@ func TestUploadInitRefusesAlreadyPublishedLauncherVersion(t *testing.T) {
 	h.UploadInit(w2, req)
 	if w2.Code != http.StatusConflict {
 		t.Fatalf("UploadInit for an already-published launcher version: got %d %s, want %d", w2.Code, w2.Body.String(), http.StatusConflict)
+	}
+}
+
+// TestUploadStreamRefusesAlreadyPublishedLauncherVersion is the streaming
+// upload's own copy of the same guard (see launcherVersionAlreadyPublished's
+// call sites). The zip part comes first over the wire, so by the time the
+// handler can even see gameId/version the zipSaved event is already flushed —
+// the rejection has to travel as an NDJSON error event, not an http.Error.
+func TestUploadStreamRefusesAlreadyPublishedLauncherVersion(t *testing.T) {
+	root := t.TempDir()
+	h := New(root)
+	h.CurrentUser = func(*http.Request) string { return "admin" }
+
+	w1 := httptest.NewRecorder()
+	h.Upload(w1, kindUploadRequest(t, "launcher", "launcher", "1.3.2", zipBytes(t, map[string]string{
+		"ChillHub.exe": "already published",
+	})))
+	if w1.Code != http.StatusOK {
+		t.Fatalf("seed upload: %d %s", w1.Code, w1.Body.String())
+	}
+
+	w2 := httptest.NewRecorder()
+	h.UploadStream(w2, streamUploadRequest(t,
+		map[string]string{"kind": "launcher", "gameId": "launcher", "version": "1.3.2"},
+		zipBytes(t, map[string]string{"ChillHub.exe": "second, different build"})))
+
+	events, garbage := ndjsonEvents(t, w2.Body.String())
+	if len(garbage) > 0 {
+		t.Fatalf("plain text in the NDJSON stream: %q", garbage)
+	}
+	if !hasErrorEvent(events) {
+		t.Fatalf("no error event for a re-upload under the same version: %s", w2.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(root, "content", "launcher", "1.3.2", "files", "ChillHub.exe"))
+	if err != nil {
+		t.Fatalf("original content missing after rejected re-upload: %v", err)
+	}
+	if string(got) != "already published" {
+		t.Fatalf("content = %q, want the first upload untouched", got)
+	}
+}
+
+// TestUploadProcessStreamRefusesAlreadyPublishedLauncherVersion covers the
+// race UploadInit's own guard cannot: a chunked upload starts while "1.3.2"
+// is still unpublished (so Init lets it through), and only becomes a conflict
+// once another publish — plain or chunked — lands before this one reaches
+// process. The comment on that call site says exactly this is why it exists;
+// this test is what makes that claim true rather than aspirational.
+func TestUploadProcessStreamRefusesAlreadyPublishedLauncherVersion(t *testing.T) {
+	h, root := adminHandlers(t)
+	zipData := zipBytes(t, map[string]string{"ChillHub.exe": "in-flight chunked build"})
+
+	id, _ := initUpload(t, h, fmt.Sprintf(
+		`{"kind":"launcher","gameId":"launcher","version":"1.3.2","zipName":"b.zip","totalSize":%d,"chunkSize":65536}`,
+		len(zipData)))
+
+	// Someone else published "1.3.2" while this chunked upload was already in
+	// flight — the exact race UploadInit's own check cannot see.
+	wPublish := httptest.NewRecorder()
+	h.Upload(wPublish, kindUploadRequest(t, "launcher", "launcher", "1.3.2", zipBytes(t, map[string]string{
+		"ChillHub.exe": "published while the chunked upload was in flight",
+	})))
+	if wPublish.Code != http.StatusOK {
+		t.Fatalf("racing publish: %d %s", wPublish.Code, wPublish.Body.String())
+	}
+
+	if w := putChunk(t, h, id, 0, zipData); w.Code != http.StatusOK {
+		t.Fatalf("chunk: %d %s", w.Code, w.Body.String())
+	}
+	if w := completeUpload(t, h, id); w.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", w.Code, w.Body.String())
+	}
+
+	w := processUpload(t, h, id)
+	events, garbage := ndjsonEvents(t, w.Body.String())
+	if len(garbage) > 0 {
+		t.Fatalf("plain text in the NDJSON stream: %q", garbage)
+	}
+	if !hasErrorEvent(events) {
+		t.Fatalf("no error event for a process racing a publish under the same version: %s", w.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(root, "content", "launcher", "1.3.2", "files", "ChillHub.exe"))
+	if err != nil {
+		t.Fatalf("winning publish's content missing: %v", err)
+	}
+	if string(got) != "published while the chunked upload was in flight" {
+		t.Fatalf("content = %q, want the racing publish's content untouched by the losing process", got)
+	}
+}
+
+// TestActivateLauncherDoesNotBlockOnNotify exercises the notify call site
+// Activate gained for gid=="launcher": it must not hang or fail the request
+// even when there is nothing at DEPLOY_KIT_NOTIFY_SCRIPT to run — the case
+// notifyPublished's own tests already cover, wired up here through the
+// handler that actually calls it, on the code path an operator uses for real.
+func TestActivateLauncherDoesNotBlockOnNotify(t *testing.T) {
+	root := t.TempDir()
+	h := New(root)
+
+	w1 := httptest.NewRecorder()
+	h.Upload(w1, kindUploadRequest(t, "launcher", "launcher", "1.3.2", zipBytes(t, map[string]string{
+		"ChillHub.exe": "build",
+	})))
+	if w1.Code != http.StatusOK {
+		t.Fatalf("seed upload: %d %s", w1.Code, w1.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/admin/api/activate?gameId=launcher&version=1.3.2", nil)
+	w2 := httptest.NewRecorder()
+	h.Activate(w2, req)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("activate: %d %s", w2.Code, w2.Body.String())
+	}
+
+	b, err := os.ReadFile(filepath.Join(root, "manifests", "launcher", "latest.json"))
+	if err != nil {
+		t.Fatalf("latest.json not written: %v", err)
+	}
+	var latest struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(b, &latest); err != nil {
+		t.Fatalf("latest.json: %v", err)
+	}
+	if latest.Version != "1.3.2" {
+		t.Fatalf("latest.json version = %q, want 1.3.2", latest.Version)
 	}
 }
