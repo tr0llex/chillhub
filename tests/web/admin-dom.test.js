@@ -1147,3 +1147,52 @@ test('галерея игры: удаление файла и папки пре�
   const fileDel = calls.filter((c) => c.url.includes('/games/gallery/delete')).pop();
   assert.match(String(fileDel.body), /name=cover\.png/);
 });
+
+// ---- Добавление игры из карточки «Игры» (mgmAddRow) ----
+
+test('mgmAddRow: запрашивает id и добавляет строку в #mgm-table', (t) => {
+  const { window, document } = loadAdminPage(t);
+  window.prompt = () => 'new-game';
+
+  window.mgmAddRow();
+
+  const rows = document.querySelectorAll('#mgm-table tbody tr');
+  assert.strictEqual(rows.length, 1, 'строка добавлена');
+  const gidInput = rows[0].querySelectorAll('td')[0].querySelector('input');
+  assert.strictEqual(gidInput.value, 'new-game');
+});
+
+test('mgmAddRow: пустой ввод в prompt ничего не добавляет', (t) => {
+  const { window, document } = loadAdminPage(t);
+
+  window.prompt = () => '';
+  window.mgmAddRow();
+  assert.strictEqual(document.querySelectorAll('#mgm-table tbody tr').length, 0, 'пустая строка не добавляется');
+
+  window.prompt = () => null;
+  window.mgmAddRow();
+  assert.strictEqual(document.querySelectorAll('#mgm-table tbody tr').length, 0, 'отмена prompt тоже ничего не добавляет');
+
+  window.prompt = () => '   ';
+  window.mgmAddRow();
+  assert.strictEqual(document.querySelectorAll('#mgm-table tbody tr').length, 0, 'один пробел — тоже пустой ввод');
+});
+
+test('mgmAddRow: отклоняет дубликат gameId и предупреждает через notify', (t) => {
+  const { window, document } = loadAdminPage(t);
+  window.prompt = () => 'lethal-company';
+  window.mgmAddRow();
+  assert.strictEqual(document.querySelectorAll('#mgm-table tbody tr').length, 1);
+
+  const notified = [];
+  window.notify = (msg) => notified.push(msg);
+  // Дубликат сравнивается без учёта регистра — та же строка входит в тот же
+  // registry-файл, что и оригинал, поэтому регистр не должен обманывать проверку.
+  window.prompt = () => 'Lethal-Company';
+  window.mgmAddRow();
+
+  assert.strictEqual(document.querySelectorAll('#mgm-table tbody tr').length, 1, 'вторая строка не добавлена');
+  assert.strictEqual(notified.length, 1, 'notify вызван ровно один раз');
+  assert.match(notified[0], /lethal-company/i);
+  assert.match(notified[0], /уже есть/);
+});
